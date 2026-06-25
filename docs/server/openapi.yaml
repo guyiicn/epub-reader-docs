@@ -1,0 +1,1321 @@
+openapi: 3.0.3
+info:
+  title: EpubReader Self-Hosted Sync Server
+  version: 1.2.0
+  description: |
+    自托管 EpubReader 同步服务器。单用户、本地 first、REST 写入业务数据 + WebSocket
+    推送变更通知。所有时间戳为 Unix epoch 毫秒 (`Long`)。Locator 字段透传 Readium
+    `Locator.toJSON()` 原文，服务器不解析。
+
+    ### V2 新增（schema_version=2，Phase E）
+
+    - **tags**：用户自定义标签 (CRUD + 增量 pull)
+    - **book-tags**：书与标签的多对多关联 (PUT/DELETE 一对一资源 + GET 增量)
+    - **reading-status**：书的阅读状态列 (NONE/WANT_TO_READ/READING/FINISHED/ABANDONED)
+    - **reading sessions**：阅读会话统计 (start/end + duration)
+    - **stats**：服务端聚合统计 (overview / 每书 / 每日)
+    - **storage/quota**：存储配额 + 各格式占用
+    - **/sync** WebSocket：实时推送 `invalidate` 事件，客户端用增量 pull 更新
+
+    ## 通用约定
+
+    - 所有路径前缀 `/api/v1`
+    - 鉴权：`Authorization: Bearer <accessToken>`
+    - 增量同步：`?since=<ts>` (毫秒)；响应 `X-Sync-Cursor` 头携带本批最大 ts，客户端持久化作下次请求
+    - 软删：`deletedAt != null` 即 tombstone；服务器保留 30 天后物理删除
+    - 冲突：LWW by `updatedAt`，平手时 `deviceId` 字典序大者赢；服务器拒绝陈旧写入返回 `409`
+    - 错误响应统一 `Problem` schema (RFC 7807 简化版)
+
+  contact:
+    name: Guyi
+    email: guyiicn@gmail.com
+
+servers:
+  - url: https://reader.example.com/api/v1
+    description: 生产 (经 Cloudflare Tunnel)
+  - url: http://localhost:8080/api/v1
+    description: 本地开发
+
+tags:
+  - name: auth
+    description: 登录、设备注册、token 刷新
+  - name: books
+    description: 书库元数据 + EPUB 文件上传/下载
+  - name: progress
+    description: 阅读进度
+  - name: bookmarks
+    description: 书签
+  - name: annotations
+    description: 高亮 + 笔记
+  - name: tags
+    description: V2 用户自定义标签
+  - name: book-tags
+    description: V2 书与标签的关联
+  - name: reading-status
+    description: V2 书的阅读状态
+  - name: sessions
+    description: V2 阅读会话统计
+  - name: stats
+    description: V2 服务端聚合统计
+  - name: storage
+    description: V2 存储配额
+  - name: realtime
+    description: V2 WebSocket 推送
+  - name: system
+    description: 健康检查
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 用户名密码登录
+      description: 单用户系统；返回 access + refresh token。access token TTL 15 分钟；refresh 30 天。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: admin
+              password: hunter2
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              example:
+                userId: 0193f5cd-2f51-7c1f-b8b8-2b3c4d5e6f70
+                accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                accessTokenExpiresAt: 1750003600000
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: 刷新 access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: 新 token 对
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/devices:
+    post:
+      tags: [auth]
+      summary: 注册或更新设备
+      description: |
+        幂等：以 `deviceId` 为唯一键。同一 deviceId 第二次调用会更新 `name`/`platform`/`lastSeenAt`。
+        客户端应在每次登录后调用一次。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRegistration'
+            example:
+              deviceId: 6f1b3c2a-9d8e-4f10-9b3c-aa1122334455
+              name: Guyi's Pixel 7
+              platform: ANDROID
+      responses:
+        '200':
+          description: 已注册
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: 撤销当前 refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '204':
+          description: 已撤销
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /books:
+    get:
+      tags: [books]
+      summary: 增量拉取书库
+      description: |
+        返回 `updatedAt > since` 的所有书（含 tombstone）。`since=0` 等价于全量。
+        响应 `X-Sync-Cursor` 头为本批最大 `updatedAt`。
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+        - $ref: '#/components/parameters/SinceQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: 书列表
+          headers:
+            X-Sync-Cursor: { $ref: '#/components/headers/SyncCursor' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Book' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [books]
+      summary: 上传 EPUB 文件 + 元数据
+      description: |
+        Multipart：`file` 是 EPUB 二进制，`metadata` 是 JSON 字符串部分。
+        服务器流式计算 SHA-256；若已存在同 hash 文件则跳过磁盘写入但仍返回 book 行 (dedup)。
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, metadata]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: EPUB 文件二进制
+                metadata:
+                  type: string
+                  description: |
+                    JSON 字符串，schema 见 `BookUploadMetadata`。前端用 `application/json`
+                    Content-Type 作为部分头。
+            encoding:
+              metadata:
+                contentType: application/json
+      responses:
+        '201':
+          description: 创建成功 (新文件或新 dedup 行)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '200':
+          description: 已存在同 contentHash 的 book，返回现有行
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /books/{id}:
+    parameters:
+      - $ref: '#/components/parameters/BookId'
+      - $ref: '#/components/parameters/XDeviceId'
+    get:
+      tags: [books]
+      summary: 单本元数据
+      responses:
+        '200':
+          description: book 行
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [books]
+      summary: 软删一本书
+      description: 设 `deletedAt = now`；EPUB 文件保留 30 天后 GC。
+      responses:
+        '204':
+          description: 已软删
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /books/{id}/file:
+    parameters:
+      - $ref: '#/components/parameters/BookId'
+      - $ref: '#/components/parameters/XDeviceId'
+    get:
+      tags: [books]
+      summary: 下载 EPUB
+      description: "支持 HTTP Range；客户端断点续传走 `Range: bytes=...`。"
+      responses:
+        '200':
+          description: 完整文件
+          content:
+            application/epub+zip:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: 部分内容 (Range)
+          content:
+            application/epub+zip:
+              schema:
+                type: string
+                format: binary
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /books/{id}/cover:
+    parameters:
+      - $ref: '#/components/parameters/BookId'
+      - $ref: '#/components/parameters/XDeviceId'
+    get:
+      tags: [books]
+      summary: 封面图
+      description: "服务器从 EPUB OPF 解析 cover 并 transcode 为 jpg；带 `Cache-Control: public, max-age=2592000`。"
+      responses:
+        '200':
+          description: 封面 JPG
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: 此书无封面或书不存在
+
+  /progress:
+    get:
+      tags: [progress]
+      summary: 增量拉取阅读进度
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+        - $ref: '#/components/parameters/SinceQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: 进度列表 (按 bookId 唯一)
+          headers:
+            X-Sync-Cursor: { $ref: '#/components/headers/SyncCursor' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Progress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /progress/{bookId}:
+    parameters:
+      - $ref: '#/components/parameters/BookIdAsBook'
+      - $ref: '#/components/parameters/XDeviceId'
+    put:
+      tags: [progress]
+      summary: 推送一本书的阅读进度
+      description: |
+        LWW：服务器比对 incoming `updatedAt` 与已有 `updatedAt`，新者保留。
+        若客户端的 `updatedAt` 更旧，返回 `409` + 服务器当前值，由客户端覆盖本地。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProgressUpsert' }
+            example:
+              locator: '{"href":"chapter5.xhtml","type":"application/xhtml+xml","locations":{"progression":0.42}}'
+              totalProgression: 0.16
+              updatedAt: 1750000123000
+              deviceId: 6f1b3c2a-9d8e-4f10-9b3c-aa1122334455
+      responses:
+        '200':
+          description: 已写入或已是更新版本
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Progress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 服务器持有更新版本；body 是 server 当前 progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Progress' }
+
+  /bookmarks:
+    get:
+      tags: [bookmarks]
+      summary: 增量拉取书签
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+        - $ref: '#/components/parameters/SinceQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: 书签列表 (含 tombstone)
+          headers:
+            X-Sync-Cursor: { $ref: '#/components/headers/SyncCursor' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Bookmark' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [bookmarks]
+      summary: 创建书签
+      description: id 由客户端生成 (UUID)。同 id 重复 POST 返回已有行 (幂等)。
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookmarkUpsert' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bookmark' }
+        '200':
+          description: 已存在 (幂等)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bookmark' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /bookmarks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/XDeviceId'
+    delete:
+      tags: [bookmarks]
+      summary: 软删一个书签
+      responses:
+        '204':
+          description: 已软删
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /annotations:
+    get:
+      tags: [annotations]
+      summary: 增量拉取高亮
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+        - $ref: '#/components/parameters/SinceQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: 高亮列表 (含 tombstone)
+          headers:
+            X-Sync-Cursor: { $ref: '#/components/headers/SyncCursor' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Annotation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [annotations]
+      summary: 创建高亮
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnnotationUpsert' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Annotation' }
+        '200':
+          description: 已存在 (幂等)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Annotation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /annotations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/XDeviceId'
+    delete:
+      tags: [annotations]
+      summary: 软删一个高亮
+      responses:
+        '204':
+          description: 已软删
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: 健康检查
+      description: |
+        无鉴权；返回服务器 + DB + 磁盘状态。Cloudflare Tunnel 健康探测和 Uptime Kuma 都打这个端点。
+      security: []
+      responses:
+        '200':
+          description: 健康
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example:
+                status: ok
+                db: up
+                disk:
+                  bytesFree: 384294967296
+                  bytesTotal: 512000000000
+                uptimeMs: 348293000
+                version: 1.0.1
+        '503':
+          description: 不健康 (任一子系统 down)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  # ==========================================================================
+  # V2 (Phase E) — tags / book-tags / reading-status / sessions / stats / storage
+  # ==========================================================================
+
+  /tags:
+    get:
+      tags: [tags]
+      summary: 增量列出标签
+      parameters:
+        - { in: query, name: since, schema: { type: integer, format: int64 } }
+        - { in: query, name: limit, schema: { type: integer, default: 500 } }
+      responses:
+        '200':
+          description: 标签列表（含 tombstone）
+          headers:
+            X-Sync-Cursor: { schema: { type: integer, format: int64 } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Tag' }
+    post:
+      tags: [tags]
+      summary: 新建标签（按 id 幂等；同名（大小写不敏感）冲突 409）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagUpsert' }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Tag' } } } }
+        '200': { description: 同 id 已存在 }
+        '409': { description: 同名标签存在, content: { application/json: { schema: { $ref: '#/components/schemas/Tag' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /tags/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [tags]
+      summary: 修改标签名/颜色（LWW by updatedAt）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagPatch' }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/Tag' } } } }
+        '409': { description: 服务器版本更新或名重复, content: { application/json: { schema: { $ref: '#/components/schemas/Tag' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [tags]
+      summary: 软删除标签
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /book-tags:
+    get:
+      tags: [book-tags]
+      summary: 增量列出书-标签关联（含 tombstone）
+      parameters:
+        - { in: query, name: since, schema: { type: integer, format: int64 } }
+        - { in: query, name: limit, schema: { type: integer, default: 500 } }
+      responses:
+        '200':
+          description: 关联列表
+          headers:
+            X-Sync-Cursor: { schema: { type: integer, format: int64 } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/BookTag' }
+
+  /books/{bookId}/tags/{tagId}:
+    parameters:
+      - { in: path, name: bookId, required: true, schema: { type: string, format: uuid } }
+      - { in: path, name: tagId,  required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [book-tags]
+      summary: 把标签贴到书上（幂等；如果之前 tombstone 会复活）
+      responses:
+        '200': { description: 已关联, content: { application/json: { schema: { $ref: '#/components/schemas/BookTag' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [book-tags]
+      summary: 解除关联（软删）
+      responses:
+        '204': { description: 已解除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /books/{id}/reading-status:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [reading-status]
+      summary: 设置书的阅读状态（更新 books.updatedAt; LWW）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReadingStatusPut' }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/Book' } } } }
+        '409': { description: 陈旧写入, content: { application/json: { schema: { $ref: '#/components/schemas/Book' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: 增量列出阅读会话
+      parameters:
+        - { in: query, name: since, schema: { type: integer, format: int64 } }
+        - { in: query, name: limit, schema: { type: integer, default: 500 } }
+      responses:
+        '200':
+          description: 会话列表
+          headers:
+            X-Sync-Cursor: { schema: { type: integer, format: int64 } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Session' }
+    post:
+      tags: [sessions]
+      summary: 创建会话（id 客户端生成；同 id 幂等返回 200）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionPost' }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '200': { description: 同 id 已存在 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sessions/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [sessions]
+      summary: 更新会话（典型用于 close：设 endedAt + durationMs + endProgression）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionPut' }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '409': { description: 陈旧写入 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /stats/overview:
+    get:
+      tags: [stats]
+      summary: 总览：总阅读时长 / 会话数 / 已开书数 / 已读完书 / 7/30 日 / 连续阅读
+      responses:
+        '200': { description: 总览, content: { application/json: { schema: { $ref: '#/components/schemas/StatsOverview' } } } }
+
+  /stats/books/{id}:
+    parameters:
+      - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [stats]
+      summary: 单书统计
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/StatsBook' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /stats/daily:
+    get:
+      tags: [stats]
+      summary: 每日（UTC）阅读时长序列（默认最近 30 天，最大跨度 1 年）
+      parameters:
+        - { in: query, name: since, schema: { type: integer, format: int64 } }
+        - { in: query, name: until, schema: { type: integer, format: int64 } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/StatsDaily' } } } }
+
+  /storage/quota:
+    get:
+      tags: [storage]
+      summary: 存储用量 + 磁盘可用 + 各格式占用明细
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/StorageQuota' } } } }
+
+  /sync:
+    get:
+      tags: [realtime]
+      summary: WebSocket 入口（实时推送变更通知）
+      description: |
+        协议升级为 WebSocket。鉴权两选一：
+          1. `?token=<accessJwt>` query 参数（移动/桌面客户端首选）
+          2. `Sec-WebSocket-Protocol: bearer.<accessJwt>` 子协议（浏览器首选，避免 token 进 URL/日志）
+
+        必须头：`X-Device-Id: <已注册 deviceId>`
+
+        握手成功后服务器先发 `hello`，随后转发 `SyncEvent`：
+          - `invalidate` 由任意 REST 写操作触发。客户端按 `table` 分发，使用本地 cursor 调用对应 `?since=cursor` 端点拉新数据。
+          - 客户端可发 `{"type":"ping"}`，服务器回 `{"type":"pong"}`。
+          - 服务器默认 25s 心跳、75s 超时；客户端应在断线后重连并立即跑一轮增量 pull 补齐期间事件。
+      responses:
+        '101': { description: 升级到 WebSocket }
+        '400': { description: 缺少 X-Device-Id 或 token }
+        '403': { description: 设备不属于该用户 }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    SinceQuery:
+      name: since
+      in: query
+      required: false
+      description: 上次同步 cursor (毫秒)；不传或 0 即全量
+      schema:
+        type: integer
+        format: int64
+        default: 0
+        minimum: 0
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      description: 单次返回最大行数；服务器可能返回更少
+      schema:
+        type: integer
+        default: 500
+        minimum: 1
+        maximum: 2000
+    BookId:
+      name: id
+      in: path
+      required: true
+      description: Book UUID
+      schema:
+        type: string
+        format: uuid
+    BookIdAsBook:
+      name: bookId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    XDeviceId:
+      in: header
+      name: X-Device-Id
+      required: true
+      schema: { type: string, format: uuid }
+      description: |
+        Identifies the calling device. Must be a registered device (POST /auth/devices).
+        Returns 400 when missing, 403 when unknown for the authenticated user.
+
+  headers:
+    SyncCursor:
+      description: 本批次最大 updatedAt；客户端持久化作下次 `?since` 入参
+      schema:
+        type: integer
+        format: int64
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 64 }
+        password: { type: string, minLength: 8, maxLength: 256 }
+
+    LoginResponse:
+      type: object
+      required: [userId, accessToken, refreshToken, accessTokenExpiresAt]
+      properties:
+        userId: { type: string, format: uuid }
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        accessTokenExpiresAt:
+          type: integer
+          format: int64
+          description: access token 过期时刻（毫秒）
+
+    DeviceRegistration:
+      type: object
+      required: [deviceId, name, platform]
+      properties:
+        deviceId: { type: string, minLength: 8, maxLength: 128 }
+        name: { type: string, maxLength: 128 }
+        platform:
+          type: string
+          enum: [ANDROID, IOS, WEB, WIN, MAC]
+
+    Device:
+      type: object
+      required: [id, userId, name, platform, lastSeenAt]
+      properties:
+        id: { type: string }
+        userId: { type: string, format: uuid }
+        name: { type: string }
+        platform:
+          type: string
+          enum: [ANDROID, IOS, WEB, WIN, MAC]
+        lastSeenAt: { type: integer, format: int64 }
+
+    BookUploadMetadata:
+      type: object
+      required: [title, author, format]
+      properties:
+        title: { type: string, maxLength: 512 }
+        author: { type: string, maxLength: 512 }
+        format:
+          type: string
+          enum: [EPUB, MOBI, MARKDOWN, TXT]
+        totalChapters: { type: integer, minimum: 0, default: 0 }
+        addedAt:
+          type: integer
+          format: int64
+          description: 客户端原导入时间；缺省则用服务器 now
+
+    Book:
+      type: object
+      required: [id, userId, contentHash, title, author, format, fileSize, addedAt, addedBy, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        contentHash:
+          type: string
+          description: SHA-256 of EPUB bytes，十六进制小写
+          pattern: '^[a-f0-9]{64}$'
+        title: { type: string }
+        author: { type: string }
+        format:
+          type: string
+          enum: [EPUB, MOBI, MARKDOWN, TXT]
+        fileSize: { type: integer, format: int64 }
+        totalChapters: { type: integer, default: 0 }
+        coverHash:
+          type: string
+          nullable: true
+          description: 封面 SHA-256，可能为 null
+        addedAt: { type: integer, format: int64 }
+        addedBy:
+          type: string
+          description: deviceId
+        updatedAt:
+          type: integer
+          format: int64
+          description: 元数据最后变更时刻 (含软删)
+        deletedAt:
+          type: integer
+          format: int64
+          nullable: true
+        readingStatus:
+          type: string
+          description: V2 阅读状态；旧客户端可忽略
+          default: NONE
+          enum: [NONE, WANT_TO_READ, READING, FINISHED, ABANDONED]
+
+    Progress:
+      type: object
+      required: [bookId, userId, locator, totalProgression, updatedAt, updatedBy]
+      properties:
+        bookId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        locator:
+          type: string
+          description: Readium Locator.toJSON() 原文
+        totalProgression:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        updatedAt: { type: integer, format: int64 }
+        updatedBy:
+          type: string
+          description: deviceId
+
+    ProgressUpsert:
+      type: object
+      required: [locator, totalProgression, updatedAt, deviceId]
+      properties:
+        locator: { type: string }
+        totalProgression: { type: number, format: double, minimum: 0, maximum: 1 }
+        updatedAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    Bookmark:
+      type: object
+      required: [id, bookId, userId, locator, color, createdAt, createdBy, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        locator: { type: string }
+        chapterTitle:
+          type: string
+          nullable: true
+        note:
+          type: string
+          nullable: true
+        color:
+          type: string
+          pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$'
+          example: '#FFC107'
+        createdAt: { type: integer, format: int64 }
+        createdBy: { type: string }
+        updatedAt: { type: integer, format: int64 }
+        deletedAt:
+          type: integer
+          format: int64
+          nullable: true
+
+    BookmarkUpsert:
+      type: object
+      required: [id, bookId, locator, color, createdAt, deviceId]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        locator: { type: string }
+        chapterTitle:
+          type: string
+          nullable: true
+        note:
+          type: string
+          nullable: true
+        color:
+          type: string
+          pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$'
+        createdAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    Annotation:
+      type: object
+      required: [id, bookId, userId, locator, selectedText, color, createdAt, createdBy, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        locator: { type: string }
+        selectedText: { type: string }
+        note:
+          type: string
+          nullable: true
+        color:
+          type: string
+          pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$'
+        createdAt: { type: integer, format: int64 }
+        createdBy: { type: string }
+        updatedAt: { type: integer, format: int64 }
+        deletedAt:
+          type: integer
+          format: int64
+          nullable: true
+
+    AnnotationUpsert:
+      type: object
+      required: [id, bookId, locator, selectedText, color, createdAt, deviceId]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        locator: { type: string }
+        selectedText: { type: string }
+        note:
+          type: string
+          nullable: true
+        color:
+          type: string
+          pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$'
+        createdAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    # ====== V2 ======
+
+    Tag:
+      type: object
+      required: [id, userId, name, color, createdAt, createdBy, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        name: { type: string, maxLength: 64 }
+        color: { type: string, pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$' }
+        createdAt: { type: integer, format: int64 }
+        createdBy: { type: string, description: deviceId }
+        updatedAt: { type: integer, format: int64 }
+        deletedAt: { type: integer, format: int64, nullable: true }
+
+    TagUpsert:
+      type: object
+      required: [id, name, color, createdAt, deviceId]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, maxLength: 64 }
+        color: { type: string, pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$' }
+        createdAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    TagPatch:
+      type: object
+      required: [updatedAt, deviceId]
+      properties:
+        name: { type: string, nullable: true, maxLength: 64 }
+        color: { type: string, nullable: true, pattern: '^#[A-Fa-f0-9]{6}([A-Fa-f0-9]{2})?$' }
+        updatedAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    BookTag:
+      type: object
+      required: [bookId, tagId, userId, createdAt, createdBy, updatedAt]
+      properties:
+        bookId: { type: string, format: uuid }
+        tagId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        createdAt: { type: integer, format: int64 }
+        createdBy: { type: string }
+        updatedAt: { type: integer, format: int64 }
+        deletedAt: { type: integer, format: int64, nullable: true }
+
+    ReadingStatusPut:
+      type: object
+      required: [readingStatus, updatedAt, deviceId]
+      properties:
+        readingStatus:
+          type: string
+          enum: [NONE, WANT_TO_READ, READING, FINISHED, ABANDONED]
+        updatedAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    Session:
+      type: object
+      required: [id, userId, bookId, deviceId, startedAt, durationMs, startProgression, endProgression, pagesTurned, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        deviceId: { type: string }
+        startedAt: { type: integer, format: int64 }
+        endedAt: { type: integer, format: int64, nullable: true }
+        durationMs: { type: integer, format: int64 }
+        startProgression: { type: number, minimum: 0, maximum: 1 }
+        endProgression: { type: number, minimum: 0, maximum: 1 }
+        pagesTurned: { type: integer }
+        updatedAt: { type: integer, format: int64 }
+
+    SessionPost:
+      type: object
+      required: [id, bookId, startedAt, deviceId]
+      properties:
+        id: { type: string, format: uuid }
+        bookId: { type: string, format: uuid }
+        startedAt: { type: integer, format: int64 }
+        startProgression: { type: number, default: 0, minimum: 0, maximum: 1 }
+        deviceId: { type: string }
+
+    SessionPut:
+      type: object
+      required: [updatedAt, deviceId]
+      properties:
+        endedAt: { type: integer, format: int64, nullable: true }
+        durationMs: { type: integer, format: int64, nullable: true }
+        endProgression: { type: number, nullable: true, minimum: 0, maximum: 1 }
+        pagesTurned: { type: integer, nullable: true }
+        updatedAt: { type: integer, format: int64 }
+        deviceId: { type: string }
+
+    StatsOverview:
+      type: object
+      required: [totalReadingMs, sessionsCount, booksOpenedCount, booksFinishedCount, last7DaysMs, last30DaysMs, currentStreakDays, longestStreakDays]
+      properties:
+        totalReadingMs:     { type: integer, format: int64 }
+        sessionsCount:      { type: integer }
+        booksOpenedCount:   { type: integer }
+        booksFinishedCount: { type: integer }
+        last7DaysMs:        { type: integer, format: int64 }
+        last30DaysMs:       { type: integer, format: int64 }
+        currentStreakDays:  { type: integer }
+        longestStreakDays:  { type: integer }
+
+    StatsBook:
+      type: object
+      required: [bookId, totalReadingMs, sessionsCount, pagesTurned]
+      properties:
+        bookId:         { type: string, format: uuid }
+        totalReadingMs: { type: integer, format: int64 }
+        sessionsCount:  { type: integer }
+        firstOpenedAt:  { type: integer, format: int64, nullable: true }
+        lastOpenedAt:   { type: integer, format: int64, nullable: true }
+        pagesTurned:    { type: integer }
+
+    DailyPoint:
+      type: object
+      required: [date, readingMs, sessionsCount]
+      properties:
+        date: { type: string, description: 'YYYY-MM-DD (UTC)' }
+        readingMs: { type: integer, format: int64 }
+        sessionsCount: { type: integer }
+
+    StatsDaily:
+      type: object
+      required: [from, to, points]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        points:
+          type: array
+          items: { $ref: '#/components/schemas/DailyPoint' }
+
+    StorageFormatBreakdown:
+      type: object
+      required: [format, count, bytes]
+      properties:
+        format: { type: string }
+        count: { type: integer }
+        bytes: { type: integer, format: int64 }
+
+    StorageQuota:
+      type: object
+      required: [usedBytes, fileCount, freeBytes, byFormat]
+      properties:
+        usedBytes: { type: integer, format: int64 }
+        fileCount: { type: integer }
+        freeBytes: { type: integer, format: int64, description: 磁盘可用字节；-1 表示无法读取 }
+        capBytes: { type: integer, format: int64, nullable: true, description: 软配额；当前永远为 null（仅 informational） }
+        byFormat:
+          type: array
+          items: { $ref: '#/components/schemas/StorageFormatBreakdown' }
+
+    SyncEvent:
+      type: object
+      description: WebSocket /sync 推送帧（hello / invalidate / pong）
+      required: [type, ts]
+      properties:
+        type:
+          type: string
+          enum: [hello, invalidate, pong]
+        table:
+          type: string
+          nullable: true
+          enum: [books, progress, bookmarks, annotations, tags, book_tags, sessions]
+        cursor: { type: integer, format: int64, nullable: true, description: invalidate 行的 updated_at；客户端用 cursor-1 做 since 拉取以避免遗漏 }
+        originDeviceId: { type: string, nullable: true, description: 触发该事件的设备；同设备收到时可忽略（已自带本地副本） }
+        targetId: { type: string, nullable: true }
+        ts: { type: integer, format: int64 }
+
+    Health:
+      type: object
+      required: [status, db, disk, uptimeMs, version]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        db:
+          type: string
+          enum: [up, down]
+        disk:
+          type: object
+          required: [bytesFree, bytesTotal]
+          properties:
+            bytesFree: { type: integer, format: int64 }
+            bytesTotal: { type: integer, format: int64 }
+        uptimeMs: { type: integer, format: int64 }
+        version: { type: string }
+
+    Problem:
+      type: object
+      description: 简化版 RFC 7807
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: 错误类型 URI 或短代码
+          example: about:blank
+        title:
+          type: string
+          description: 人类可读简短描述
+          example: Invalid credentials
+        status:
+          type: integer
+          description: HTTP status code
+          example: 401
+        detail:
+          type: string
+          description: 详细说明（可选）
+        instance:
+          type: string
+          description: 请求路径（可选）
+
+  responses:
+    BadRequest:
+      description: 请求体不合法
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Validation failed
+            status: 400
+            detail: "field 'locator' is required"
+    Unauthorized:
+      description: 缺少 / 过期 / 无效 token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Unauthorized
+            status: 401
+    Forbidden:
+      description: 已认证但无权限
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Forbidden
+            status: 403
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Not Found
+            status: 404
+    Conflict:
+      description: 服务器持有更新版本 (LWW 拒绝陈旧写入)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Stale update
+            status: 409
+            detail: server updatedAt is newer
+    PreconditionFailed:
+      description: ETag/If-Match 不匹配
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Precondition Failed
+            status: 412
+    ServerError:
+      description: 内部错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Internal Server Error
+            status: 500
+
+# =============================================================================
+# WebSocket /sync 的契约现在作为 paths./sync GET 路径文档 + SyncEvent schema
+# 描述（components.schemas.SyncEvent）。下面保留一份扩展字段做长形说明。
+# =============================================================================
+x-websocket:
+  endpoint: /api/v1/sync
+  auth:
+    description: |
+      鉴权方式两选一：
+        1. `?token=<accessJwt>` query 参数 — 移动 / 桌面客户端首选
+        2. `Sec-WebSocket-Protocol: bearer.<accessJwt>` 子协议 — 浏览器首选
+
+      握手时必须头 `X-Device-Id: <已注册 deviceId>`。
+  flow:
+    - 服务器握手成功 → 立即发 `{"type":"hello","ts":...}`
+    - 任意 REST 写操作（books/progress/bookmarks/annotations/tags/book_tags/reading_status/sessions）
+      触发 broadcaster.publishInvalidate(userId, table, cursor, originDeviceId, targetId)
+    - 该 userId 所有 WebSocket 会话（除 originDeviceId）收到
+      `{"type":"invalidate","table":"...","cursor":...,"originDeviceId":"...","targetId":"...","ts":...}`
+    - 客户端按 table 路由到对应 sync 调度器，使用本地 cursor 调用 `?since=cursor` 增量端点拉数据
+  pingPong:
+    - 客户端发 `{"type":"ping"}` → 服务器立即回 `{"type":"pong","ts":...}`
+    - 服务器侧 25s 心跳、75s 闲置超时（Ktor `pingPeriod` / `timeout`）
+  closeCodes:
+    - 1000: 正常关闭
+    - 1011: 服务端异常
+    - 4001: 鉴权失败 (token 缺失 / 无效 / 非 access)
+    - 4003: 设备未注册或不属于该用户
+  reconnect: |
+    断线后客户端应：
+      1. 立即重连（指数退避：1s → 2s → 4s ... 上限 30s）
+      2. 重连成功后跑一轮 REST 增量 pull（books / progress / 所有 V2 表），保证期间错过的事件被补齐
