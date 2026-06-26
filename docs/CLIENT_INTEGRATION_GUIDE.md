@@ -827,3 +827,61 @@ V1 introduced `BookSyncState ∈ {SYNCED, LOCAL_ONLY, REMOTE_ONLY, OPTED_OUT, CO
 - Typical UX transitions: NONE → WANT_TO_READ → READING → FINISHED, plus the side branch ABANDONED.
 - Server enforces no transition rules — clients pick. PUT bumps `books.updatedAt`, so existing `/books?since=` pulls already surface the change.
 - Status is global per user (not per device).
+
+---
+
+## Phase S Addendum (找书 / 在线下载)
+
+Server `1.3.0+`. Backwards compatible — clients that don't implement search are unaffected. Lets a client search Z-Library through the server and pull a chosen book **straight into the user's library** (no client-side download). The authoritative per-field contract is `find-book-api-actual.md` (next to this file); this addendum is the summary.
+
+### A. Two endpoints
+
+| Endpoint | Verb | Purpose |
+|---|---|---|
+| `/search?q=&page=&preference=` | GET | Search Z-Library; returns parsed results + `alreadyInLibrary` |
+| `/search/download` | POST | Download a result by `bookCommand` and ingest into the library |
+
+Same auth as everything else: `Authorization: Bearer <accessToken>` + `X-Device-Id: <deviceId>`.
+
+### B. `GET /search`
+
+```
+GET /api/v1/search?q=漫长的告别&page=1&preference=epub%20单本不要合集
+```
+
+- `q` (required, 1-200 chars), `page` (optional, 1-20, default 1), `preference` (optional free text → LLM rerank/filter).
+- Returns `{ query, total, page, hasNext, hasPrev, books[], alreadyInLibrary[] }`.
+- Each `book` is **Bot-original, un-normalized**: `index, title, author, year?, language?, format (lowercase), size (human), bookCommand, coverUrl?`.
+- `alreadyInLibrary` is a list of `bookCommand`s already in the user's library — render a "已在库中" badge. Server matches both by exact `source_command` and by case-insensitive `(title, author)`.
+
+**Gotchas**
+- `total` is the Bot's cross-page count; per-page list is short (~5). Paging is slow (≈ page × 5 s — server clicks "next" N-1 times). Encourage precise queries over deep paging.
+- `format` here is **lowercase** Bot text (`"epub"`); the downloaded `Book.format` is **uppercase** (`"EPUB"`).
+- `coverUrl` is a Z-Library direct link with embedded auth params and may be unreachable on some networks — fall back to a placeholder.
+- `preference` triggers an OpenAI-format LLM that reorders and may **drop** entries (returned `books` length can shrink). LLM failure silently falls back to baseline order — never blocks the response.
+- Errors: `400` validation, `401`/`403` auth, **`502`** when the Z-Library bridge / Telethon session fails (`detail` carries the cause). **No `429`** — rate limiting is not implemented yet.
+
+### C. `POST /search/download`
+
+```json
+{ "bookCommand": "/book_aJO7axr7Zj3", "title": "漫长的告别", "author": "Raymond Chandler" }
+```
+
+- `bookCommand` (required, must start `/book_`), `title` (required), `author` (optional).
+- **This permanently adds the book to the library** — same ingest pipeline as `POST /books` (SHA-256 dedup, cover extract, insert with `source_command`, `invalidate(books)` broadcast). UI copy must say "加入书库", not "preview".
+- **`201`** = freshly downloaded + ingested → full `Book` DTO. **`200`** = dedup hit (same `source_command` already present) → existing `Book`, fast path ~13 ms, no Bot round-trip.
+- Errors: `410` (bookCommand expired — tell the user to re-search), `413` (file > 50 MB Bot limit or > 100 MB server cap), `500` (ingest failed), `502` (Bot/session/network). There is **no** `202`/jobId async path and **no** `/search/download/status/{jobId}` endpoint — everything is synchronous.
+
+### D. WebSocket interplay
+
+A successful download fires the existing `invalidate{table:"books"}` frame (see V2 Addendum §B). **Other** signed-in devices pull `/books?since=cursor-1` and the new book appears within ~1 s. The **initiating** device already has the `Book` in the 200/201 body — drop the echo via the `originDeviceId == self` filter, exactly as for normal writes.
+
+### E. Persistence advice
+
+`bookCommand` maps to transient Bot conversation state — usually valid for hours, but a long-lived "save for later" must store `(title, author)` and re-search for a fresh command rather than persisting `bookCommand` (which returns `410` once stale).
+
+### F. Not yet implemented (Phase S gaps)
+
+- Rate limiting (no `429`).
+- Audit-log ops for SEARCH / DOWNLOAD (needs a `sync_log.operation` CHECK widening migration).
+- Server cover proxy (`/search/covers/{hash}`) — clients hit the Z-Library URL directly for now.

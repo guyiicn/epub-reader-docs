@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EpubReader Self-Hosted Sync Server
-  version: 1.2.0
+  version: 1.3.0
   description: |
     自托管 EpubReader 同步服务器。单用户、本地 first、REST 写入业务数据 + WebSocket
     推送变更通知。所有时间戳为 Unix epoch 毫秒 (`Long`)。Locator 字段透传 Readium
@@ -16,6 +16,12 @@ info:
     - **stats**：服务端聚合统计 (overview / 每书 / 每日)
     - **storage/quota**：存储配额 + 各格式占用
     - **/sync** WebSocket：实时推送 `invalidate` 事件，客户端用增量 pull 更新
+
+    ### Phase S 新增（找书 / 在线下载）
+
+    - **search**：`GET /search` 经服务端 Z-Library 桥接搜书；`POST /search/download`
+      代客户端下载并直接入库（dedup + 封面提取 + WebSocket 广播）。可选 `?preference=`
+      触发 OpenAI 格式 LLM 重排/过滤。详见 `find-book-api-actual.md` 契约文档。
 
     ## 通用约定
 
@@ -59,6 +65,8 @@ tags:
     description: V2 服务端聚合统计
   - name: storage
     description: V2 存储配额
+  - name: search
+    description: Phase S 找书 / 在线下载（Z-Library 桥接 + 可选 LLM 重排）
   - name: realtime
     description: V2 WebSocket 推送
   - name: system
@@ -737,6 +745,104 @@ paths:
         '400': { description: 缺少 X-Device-Id 或 token }
         '403': { description: 设备不属于该用户 }
 
+  /search:
+    get:
+      tags: [search]
+      summary: Z-Library 找书
+      description: |
+        经服务端 Telethon 桥接 `@zlibguyii_bot` 搜索，返回正则解析后的结果列表。
+
+        - **串行化**：服务端用全局 Mutex 串行所有 Bot 调用，多请求会排队。基线延迟 ~5-7s（Bot 是瓶颈）。
+        - **翻页**：`page>1` 实现为「搜关键词 → click next 按钮 N-1 次」，延迟 ≈ N × 5s。鼓励 UX「搜得准」而非翻多页。
+        - **LLM 重排（可选）**：带 `?preference=<自由文本>` 时调用 OpenAI 格式 LLM 重排/过滤；
+          `books` 返回过滤+重排后的结果（长度可能 < 原始页大小）。LLM 失败静默退回原顺序。
+        - **alreadyInLibrary**：服务端用 `source_command` 精确匹配 + `(title, author)` 大小写不敏感模糊匹配，
+          两路并集判定哪些结果已在用户书库。
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+        - name: q
+          in: query
+          required: true
+          description: 搜索关键词，1-200 字符，trimmed
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: page
+          in: query
+          required: false
+          description: 页码，默认 1，范围 1-20
+          schema: { type: integer, default: 1, minimum: 1, maximum: 20 }
+        - name: preference
+          in: query
+          required: false
+          description: |
+            自由文本（中英文皆可），触发 LLM 重排/过滤。例：`epub 优先，单本不要合集`。
+            未配置 LLM 或调用失败时被忽略，返回基线结果。
+          schema: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '502':
+          description: Z-Library 桥接失败（Bot 通信失败 / Telethon session 失效）；`detail` 含原始错误
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /search/download:
+    post:
+      tags: [search]
+      summary: 代下载并入库
+      description: |
+        **不是单纯代理下载** —— 文件会**永久写入用户书库**（同 `POST /books` 的 ingest 管道：
+        SHA-256 dedup、cover 提取、insert with `source_command`、AuditLog、WebSocket `invalidate(books)` 广播）。
+        客户端 UI 文案应明示「加入书库」。
+
+        - **快路径 dedup**：若 `bookCommand` 对应的 `source_command` 已存在，直接返回现有 Book（~13ms，不走 Bot）。
+        - **下载后另一台已登录设备会收到 `invalidate(books)`**，自动 pull 看到新书；发起方在 200/201 响应里已拿到 Book，应忽略自己的 invalidate（`originDeviceId` 过滤）。
+        - **bookCommand 时效**：对应 Bot 对话状态，数小时内通常有效，长期保存可能失效返 `410`。
+          客户端做「收藏待读」应保存 `(title, author)` 而非 bookCommand，下次重搜拿新 command。
+      parameters:
+        - $ref: '#/components/parameters/XDeviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DownloadRequest' }
+      responses:
+        '201':
+          description: 新下载并入库
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '200':
+          description: dedup 命中（同 source_command 已存在），返回现有 Book（快路径）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '410':
+          description: bookCommand 过期 / 失效（搜索结果上下文已被替换）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413':
+          description: 文件超出免费 Bot 的 50MB 限制，或超过服务器 100MB 硬上限
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '502':
+          description: Bot 不响应 / Telethon session 死 / 网络问题
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -891,6 +997,74 @@ components:
           description: V2 阅读状态；旧客户端可忽略
           default: NONE
           enum: [NONE, WANT_TO_READ, READING, FINISHED, ABANDONED]
+
+    SearchBook:
+      type: object
+      description: 单条搜索结果。字段为 Bot 原文解析所得，未经规范化。
+      required: [index, title, author, format, size, bookCommand]
+      properties:
+        index:
+          type: integer
+          description: 当前页内序号（LLM 重排后会被重排为 1..N）
+        title: { type: string, description: 原文，可能含 emoji / 标点 }
+        author: { type: string, description: 原文，常含「著 ; 译」等中文后缀 }
+        year:
+          type: string
+          nullable: true
+          description: 出版年，例 "2017"；Bot 上游可能缺这行所以 nullable
+        language:
+          type: string
+          nullable: true
+          description: 例 "Chinese" / "English"
+        format:
+          type: string
+          description: 小写格式串（Bot 原文），例 "epub" / "mobi" / "pdf"
+        size: { type: string, description: 人类可读大小，例 "410 KB" / "6.19 MB" }
+        bookCommand:
+          type: string
+          description: '`/book_xxxx` 命令；客户端透明保存，下载时原样回传'
+          pattern: '^/book_'
+        coverUrl:
+          type: string
+          nullable: true
+          description: |
+            Z-Library 直链（含 `remix_userid` / `remix_userkey` 鉴权参数）。
+            可能跨网络访问不到 —— 客户端展示失败应 fallback 占位图。
+
+    SearchResult:
+      type: object
+      required: [query, total, page, hasNext, hasPrev, books, alreadyInLibrary]
+      properties:
+        query: { type: string }
+        total: { type: integer, description: Bot 报告的总命中数（跨页） }
+        page: { type: integer }
+        hasNext: { type: boolean }
+        hasPrev: { type: boolean }
+        books:
+          type: array
+          items: { $ref: '#/components/schemas/SearchBook' }
+        alreadyInLibrary:
+          type: array
+          description: 已在用户书库的结果对应的 bookCommand 列表
+          items: { type: string }
+
+    DownloadRequest:
+      type: object
+      required: [bookCommand, title]
+      properties:
+        bookCommand:
+          type: string
+          description: 必须 `/book_` 开头
+          pattern: '^/book_'
+        title:
+          type: string
+          description: 用作 books.title；服务器 trim + 截到 512 字符
+          maxLength: 512
+        author:
+          type: string
+          description: 默认空串；同样 trim + 截 512
+          default: ""
+          maxLength: 512
 
     Progress:
       type: object
