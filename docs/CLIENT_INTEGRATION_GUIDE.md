@@ -152,7 +152,7 @@ Content-Type: application/json
 {
   "deviceId":  "<UUID you generated>",
   "name":      "Guyi's Surface Pro",
-  "platform":  "WIN"     // one of: ANDROID, IOS, WEB, WIN, MAC
+  "platform":  "WIN"     // one of: ANDROID, IOS, WEB, WIN, MAC, LNX, CLI
 }
 ```
 
