@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EpubReader Self-Hosted Sync Server
-  version: 1.3.0
+  version: 1.4.0
   description: |
     自托管 EpubReader 同步服务器。单用户、本地 first、REST 写入业务数据 + WebSocket
     推送变更通知。所有时间戳为 Unix epoch 毫秒 (`Long`)。Locator 字段透传 Readium
@@ -930,7 +930,7 @@ components:
         name: { type: string, maxLength: 128 }
         platform:
           type: string
-          enum: [ANDROID, IOS, WEB, WIN, MAC]
+          enum: [ANDROID, IOS, WEB, WIN, MAC, LNX, CLI]
 
     Device:
       type: object
@@ -941,7 +941,7 @@ components:
         name: { type: string }
         platform:
           type: string
-          enum: [ANDROID, IOS, WEB, WIN, MAC]
+          enum: [ANDROID, IOS, WEB, WIN, MAC, LNX, CLI]
         lastSeenAt: { type: integer, format: int64 }
 
     BookUploadMetadata:
